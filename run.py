@@ -14,14 +14,14 @@ parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "
 parser.add_argument("--tiled-vae", action="store_true", default=True, help="Enable tile decoding")
 parser.add_argument("--tiled-dit", action="store_true", default=True, help="Enable tile inference")
 parser.add_argument("--tile-size", type=int, default=152, help="Chunk size of tile inference, default=128")
-parser.add_argument("--overlap", type=int, default=24, help="Overlap size of tile inference, default=24")
+parser.add_argument("--overlap", type=int, default=48, help="Overlap size of tile inference, default=48")
 parser.add_argument("--unload-dit", action="store_true", help="Unload DiT before decoding")
-parser.add_argument("--color-fix", action="store_true", help="Correct output video color")
+parser.add_argument("--color-fix", action="store_true", default=True, help="Correct output video color")
 parser.add_argument("--seed", type=int, default=0, help="Random Seed, default=0")
-parser.add_argument("-t", "--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Data type for processing, default=fp16")
+parser.add_argument("-t", "--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Data type for processing, default=bf16")
 parser.add_argument("-d", "--device", type=str, default="auto", help="Device to run FlashVSR")
 parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for image sequences only), default=30")
-parser.add_argument("-q", "--quality", type=int, default=6, help="Output video quality, default=6")
+parser.add_argument("-q", "--quality", type=int, default=10, help="Output video quality, default=10")
 parser.add_argument("-a", "--attention", default="block", choices=["sage", "block"], help="Attention mode, default=block")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
@@ -118,41 +118,59 @@ def save_video(frames, save_path, fps=30, quality=5):
             writer.append_data(frame_np)
 
 def merge_video_with_audio(video_path, audio_source_path):
-    temp = video_path+"temp.mp4"
+    # Use a more robust temporary file path
+    temp_output_path = os.path.join(os.path.dirname(video_path), f"temp_audio_merge_{uuid.uuid4()}.mp4")
     
     if os.path.isdir(audio_source_path):
-        log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
+        log(f"[FlashVSR] Input is a directory, skipping audio merge. Output video saved to '{video_path}'", message_type='info')
         return
     
     if not is_ffmpeg_available():
-        log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
+        log(f"[FlashVSR] FFmpeg not found, skipping audio merge. Output video saved to '{video_path}'", message_type='info')
         return
     
     try:
+        log(f"[FlashVSR] Probing '{audio_source_path}' for audio streams...")
         probe = ffmpeg.probe(audio_source_path)
         audio_streams = [s for s in probe['streams'] if s['codec_type'] == 'audio']
-        if not audio_streams:
-            log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
-            return
-        log("[FlashVSR] Copying audio tracks...")
-        os.rename(video_path, temp)
-        input_video = ffmpeg.input(temp)['v']
-        input_audio = ffmpeg.input(audio_source_path)['a']
-        output_ffmpeg = ffmpeg.output(
-            input_video, input_audio, video_path,
-            vcodec='copy', acodec='copy'
-        ).run(overwrite_output=True, quiet=True)
-        log(f"[FlashVSR] Output video saved to '{video_path}'", message_type='info')
-    except ffmpeg.Error as e:
-        print("[ERROR] FFmpeg error during merge:", e.stderr.decode() if e.stderr else "Unknown error")
-        log(f"[FlashVSR] Audio merge failed. A silent video has been saved to '{video_path}'.", message_type='warning')
         
-    finally:
-        if os.path.exists(temp):
-            try:
-                os.remove(temp)
-            except OSError as e:
-                lgo(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
+        if not audio_streams:
+            log(f"[FlashVSR] No audio streams found in '{audio_source_path}'. A silent video has been saved to '{video_path}'.", message_type='warning')
+            return
+            
+        log("[FlashVSR] Audio stream found. Starting audio copy...")
+        
+        input_video = ffmpeg.input(video_path)['v']
+        input_audio = ffmpeg.input(audio_source_path)['a']
+        
+        # Run ffmpeg, but without 'quiet=True' to see potential errors
+        (
+            ffmpeg
+            .output(input_video, input_audio, temp_output_path, vcodec='copy', acodec='copy')
+            .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+        )
+        
+        # If ffmpeg succeeds, replace the original silent video with the new one
+        os.remove(video_path)
+        os.rename(temp_output_path, video_path)
+        
+        log(f"[FlashVSR] Audio successfully merged. Final video saved to '{video_path}'", message_type='finish')
+        
+    except ffmpeg.Error as e:
+        log("[FlashVSR] FFmpeg error during audio merge:", message_type='error')
+        # Decode and print stderr for detailed error info
+        error_message = e.stderr.decode().strip() if e.stderr else "Unknown FFmpeg error"
+        log(f"FFmpeg stderr:\n{error_message}", message_type='error')
+        log(f"Audio merge failed. A silent video has been saved to '{video_path}'.", message_type='warning')
+        # Clean up the temporary file if it exists
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
+            
+    except Exception as e:
+        log(f"[FlashVSR] An unexpected error occurred during audio merge: {e}", message_type='error')
+        log(f"Audio merge failed. A silent video has been saved to '{video_path}'.", message_type='warning')
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
     
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
@@ -331,13 +349,42 @@ def create_feather_mask_numpy(size, overlap):
 def create_feather_mask(size, overlap):
     H, W = size
     mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
+    # Use a 2D Gaussian ramp for the smoothest possible blending.
+    if overlap == 0:
+        return mask
+
+    sigma = overlap / 2.0  # A wider Gaussian for a smoother blend
     
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    # Create coordinate grids
+    y_coords = torch.arange(H, dtype=torch.float32, device='cpu')
+    x_coords = torch.arange(W, dtype=torch.float32, device='cpu')
+    y, x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+    # Create distance maps from each edge
+    dist_to_top = y
+    dist_to_bottom = H - 1 - y
+    dist_to_left = x
+    dist_to_right = W - 1 - x
+
+    # Create Gaussian weights for each edge
+    weight_top = torch.exp(-0.5 * (dist_to_top / sigma)**2)
+    weight_bottom = torch.exp(-0.5 * (dist_to_bottom / sigma)**2)
+    weight_left = torch.exp(-0.5 * (dist_to_left / sigma)**2)
+    weight_right = torch.exp(-0.5 * (dist_to_right / sigma)**2)
+
+    # The final weight at any point is the minimum of its distance-based weights to all four edges.
+    weights = torch.minimum(
+        torch.minimum(weight_top, weight_bottom),
+        torch.minimum(weight_left, weight_right)
+    )
     
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    # Normalize weights to ensure the center is close to 1
+    weights = torch.clamp(weights / (weights.max() + 1e-8), 0, 1)
+    
+    # Ensure the very edge is not exactly zero to avoid black lines
+    weights = weights * (1.0 - 1e-6) + 1e-6
+    
+    mask = weights.unsqueeze(0).unsqueeze(0)
     
     return mask
 
@@ -407,12 +454,39 @@ def stitch_video_tiles(
                     
                     # 6. 创建羽化蒙版 (只需要创建一次)
                     tile_H, tile_W, _ = tile_chunk_np.shape[1:]
-                    ramp = np.linspace(0, 1, overlap * scale, dtype=np.float32)
-                    mask = np.ones((tile_H, tile_W, 1), dtype=np.float32)
-                    mask[:, :overlap*scale, :] *= ramp[np.newaxis, :, np.newaxis]
-                    mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
-                    mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
-                    mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
+                    # Use a 2D Gaussian ramp for the smoothest possible blending.
+                    feather_margin = overlap * scale
+                    if feather_margin <= 0:
+                        mask = np.ones((tile_H, tile_W, 1), dtype=np.float32)
+                    else:
+                        sigma = feather_margin / 2.0 # A wider Gaussian for a smoother blend
+                        
+                        y_coords = np.arange(tile_H, dtype=np.float32)
+                        x_coords = np.arange(tile_W, dtype=np.float32)
+                        y, x = np.meshgrid(y_coords, x_coords, indexing='ij')
+
+                        dist_to_top = y
+                        dist_to_bottom = tile_H - 1 - y
+                        dist_to_left = x
+                        dist_to_right = tile_W - 1 - x
+
+                        weight_top = np.exp(-0.5 * (dist_to_top / sigma)**2)
+                        weight_bottom = np.exp(-0.5 * (dist_to_bottom / sigma)**2)
+                        weight_left = np.exp(-0.5 * (dist_to_left / sigma)**2)
+                        weight_right = np.exp(-0.5 * (dist_to_right / sigma)**2)
+
+                        weights = np.minimum(
+                            np.minimum(weight_top, weight_bottom),
+                            np.minimum(weight_left, weight_right)
+                        )
+                        
+                        # Normalize weights to ensure the center is close to 1
+                        weights = np.clip(weights / (np.max(weights) + 1e-8), 0, 1)
+                        
+                        # Ensure the very edge is not exactly zero
+                        weights = weights * (1.0 - 1e-6) + 1e-6
+                        
+                        mask = weights[:, :, np.newaxis]
                     # 扩展蒙版以匹配 chunk 的帧数维度
                     mask_4d = mask[np.newaxis, :, :, :] # 形状: (1, H, W, C)
                     
