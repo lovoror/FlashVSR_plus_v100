@@ -1,0 +1,1 @@
+E:\AI\wan-video\py312\python.exe .\run.py -i WanVideo2_1_InfiniteTalk_00022-audio.mp4 -s 2 ./ -d cuda:1

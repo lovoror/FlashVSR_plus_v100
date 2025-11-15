@@ -41,7 +41,8 @@ def _attn_fwd_inner(acc, l_i, old_m, q, q_scale, kv_len,
             k_mask = offs_n[None, :] < (kv_len - start_n)   
             k = tl.load(K_ptrs, mask = k_mask)
             k_scale = tl.load(K_scale_ptr)
-            qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
+            acc = tl.dot(q, k, out_dtype=tl.int32)
+            qk = acc.to(tl.float32) * q_scale * k_scale
             if STAGE == 2:
                 mask = offs_m[:, None] >= (start_n + offs_n[None, :])
                 qk = qk + tl.where(mask, 0, -1.0e6)
@@ -118,7 +119,7 @@ def _attn_fwd(Q, K, K_blkid, V, Q_scale, K_scale, Out,
 
 def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layout="HND", output_dtype=torch.float16):
     BLOCK_M = 128
-    BLOCK_N = 64
+    BLOCK_N = HEAD_DIM_K
     stage = 3 if is_causal else 1
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -155,7 +156,7 @@ def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layou
         k_block_id.stride(1), k_block_id.stride(2),
         qo_len, kv_len,
         h_qo, num_kv_groups,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
+        BLOCK_M=BLOCK_M, BLOCK_N=HEAD_DIM_K, HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,  
         num_warps=4 if head_dim == 64 else 8,
         num_stages=4)

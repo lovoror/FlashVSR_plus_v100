@@ -221,81 +221,17 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # Attention kernels
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
-    if attention_mask is not None:
-        seqlen = q.shape[1]
-        seqlen_kv = k.shape[1]
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
-        else:
-            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-        head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
-        streaming_info = None
-        base_blockmask = attention_mask
-        max_seqlen_q_ = seqlen
-        max_seqlen_k_ = seqlen_kv
-        p_dropout = 0.0
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            x = block_sparse_attn_func(
-                q, k, v,
-                cu_seqlens_q, cu_seqlens_k,
-                head_mask_type,
-                streaming_info,
-                base_blockmask,
-                max_seqlen_q_, max_seqlen_k_,
-                p_dropout,
-                deterministic=False,
-                softmax_scale=None,
-                is_causal=False,
-                exact_streaming=False,
-                return_attn_probs=False,
-            ).unsqueeze(0)
-            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-        else:
-            x = sparse_sageattn(
-                q, k, v,
-                mask_id=base_blockmask.to(torch.int8),
-                is_causal=False,
-                tensor_layout="HND"
-            )
-            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif compatibility_mode:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn_interface.flash_attn_func(q, k, v)
-        if isinstance(x, tuple):
-            x = x[0]
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_2_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        x = flash_attn.flash_attn_func(q, k, v)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    elif SAGE_ATTN_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    # Universal compatibility implementation using standard PyTorch
+    q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    
+    # The original code used a block-sparse mask which is not compatible with F.scaled_dot_product_attention.
+    # By passing attention_mask=None from the calling function, we perform dense attention within the window.
+    # This is less memory-efficient than the original kernels but guarantees compatibility.
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=None)
+    
+    x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
 
 
@@ -423,12 +359,10 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
-        else:
-            attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
-
-        x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+        # Disabled sparse attention mask generation for compatibility.
+        # Dense attention will be performed within the tile, which is memory-safe due to tiling.
+        attention_mask = None
+        x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask=attention_mask)
 
         cur_block_n, cur_block_s, _ = k_w.shape
         cache_num = cur_block_n // one_len

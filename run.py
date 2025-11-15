@@ -3,24 +3,26 @@
 
 import sys
 import argparse
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 parser = argparse.ArgumentParser(description="FlashVSR+: Towards Real-Time Diffusion-Based Streaming Video Super-Resolution.")
 parser.add_argument("-i", "--input", type=str, help="Path to video file or folder of images")
 parser.add_argument("-s", "--scale", type=int, default=4, help="Upscale factor, default=4")
 parser.add_argument("-v", "--version", type=str, default="10", choices=["10", "11"], help="Model version, default=10")
 parser.add_argument("-m", "--mode", type=str, default="tiny", choices=["tiny", "tiny-long", "full"], help="The type of pipeline to use, default=tiny")
-parser.add_argument("--tiled-vae", action="store_true", help="Enable tile decoding")
-parser.add_argument("--tiled-dit", action="store_true", help="Enable tile inference")
-parser.add_argument("--tile-size", type=int, default=256, help="Chunk size of tile inference, default=256")
+parser.add_argument("--tiled-vae", action="store_true", default=True, help="Enable tile decoding")
+parser.add_argument("--tiled-dit", action="store_true", default=True, help="Enable tile inference")
+parser.add_argument("--tile-size", type=int, default=152, help="Chunk size of tile inference, default=128")
 parser.add_argument("--overlap", type=int, default=24, help="Overlap size of tile inference, default=24")
 parser.add_argument("--unload-dit", action="store_true", help="Unload DiT before decoding")
 parser.add_argument("--color-fix", action="store_true", help="Correct output video color")
 parser.add_argument("--seed", type=int, default=0, help="Random Seed, default=0")
-parser.add_argument("-t", "--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Data type for processing, default=bf16")
+parser.add_argument("-t", "--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Data type for processing, default=fp16")
 parser.add_argument("-d", "--device", type=str, default="auto", help="Device to run FlashVSR")
 parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for image sequences only), default=30")
 parser.add_argument("-q", "--quality", type=int, default=6, help="Output video quality, default=6")
-parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block"], help="Attention mode, default=sage")
+parser.add_argument("-a", "--attention", default="block", choices=["sage", "block"], help="Attention mode, default=block")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
 
@@ -54,7 +56,10 @@ import torch.nn.functional as F
 from PIL import Image
 from einops import rearrange
 from huggingface_hub import snapshot_download
-from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
+from src.models.model_manager import ModelManager
+from src.pipelines.flashvsr_full import FlashVSRFullPipeline
+from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
+from src.pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
 from src.models import wan_video_dit
 from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
@@ -106,11 +111,11 @@ def is_video(path):
 
 def save_video(frames, save_path, fps=30, quality=5):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-    w = imageio.get_writer(save_path, fps=fps, quality=quality)
-    for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
-        w.append_data(frame_np)
-    w.close()
+    with imageio.get_writer(save_path, fps=fps, quality=quality) as writer:
+        for frame_tensor in tqdm(frames, desc="[FlashVSR] Saving video"):
+            # Process one frame at a time to save RAM
+            frame_np = (frame_tensor.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+            writer.append_data(frame_np)
 
 def merge_video_with_audio(video_path, audio_source_path):
     temp = video_path+"temp.mp4"
@@ -463,7 +468,7 @@ def init_pipeline(version, mode, device, dtype):
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
     if not os.path.exists(tcd_path):
         raise RuntimeError(f'"TCDecoder.ckpt" does not exist! Please save it to "{model_path}"')
-    prompt_path = os.path.join(root, "models", "posi_prompt.pth")
+    prompt_path = os.path.join(model_path, "posi_prompt.pth")
     
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     if mode == "full":
@@ -540,6 +545,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
         pipe = init_pipeline(version, mode, _device, dtype)
         
+        temp_name = None # Initialize temp_name
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             input_tile = frames[:, y1:y2, x1:x2, :]
                 
@@ -595,6 +601,9 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         else:
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas / weight_sum_canvas
+        
+        del pipe
+        clean_vram()
     else:
         if mode == "tiny-long":
             th, tw, F = get_input_params(frames, scale=scale)
